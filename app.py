@@ -6,6 +6,8 @@ from flask import Flask, jsonify, request
 import threading
 import time
 import logging
+import random
+from queue import Queue, Empty
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -25,22 +27,154 @@ jwt_tokens = {}
 jwt_expiry = {}
 jwt_lock = threading.Lock()
 
-# ------------------ HTTP Session with Retries ------------------
+# ------------------ HTTP Session / Rate Limit Queue ------------------
+# The upstream API can return HTTP 429 when too many requests arrive too quickly.
+# We use a single bounded worker queue so requests are serialized and spaced out,
+# while Retry-After/exponential backoff handles transient 429/5xx responses.
+REQUEST_QUEUE_SIZE = 50
+REQUEST_INTERVAL = 0.75
+MAX_RETRIES = 4
+CONNECT_TIMEOUT = 5
+READ_TIMEOUT = 15
+
+request_queue = Queue(maxsize=REQUEST_QUEUE_SIZE)
+last_upstream_request = 0.0
+request_pacing_lock = threading.Lock()
+
+
 def create_http_session():
     session = requests.Session()
+    # Do not blindly retry 429 here: the queue worker below handles it so we can
+    # respect Retry-After and avoid a retry storm.
     retry = Retry(
-        total=3,
+        total=2,
+        connect=2,
+        read=2,
+        status=2,
         backoff_factor=0.5,
         status_forcelist=[500, 502, 503, 504],
-        allowed_methods=["GET", "POST"]
+        allowed_methods=["GET", "POST"],
+        respect_retry_after_header=True,
+        raise_on_status=False,
     )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
-    session.mount('http://', adapter)
-    session.mount('https://', adapter)
-    session.timeout = (5, 10)  # connect timeout, read timeout
+    adapter = HTTPAdapter(
+        max_retries=retry,
+        pool_connections=10,
+        pool_maxsize=10,
+    )
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
     return session
 
+
 http_session = create_http_session()
+
+
+def _pace_upstream_request():
+    global last_upstream_request
+    with request_pacing_lock:
+        now = time.monotonic()
+        wait = REQUEST_INTERVAL - (now - last_upstream_request)
+        if wait > 0:
+            time.sleep(wait)
+        last_upstream_request = time.monotonic()
+
+
+def _retry_after_seconds(response, attempt):
+    value = response.headers.get("Retry-After")
+    if value:
+        try:
+            return min(30.0, max(0.0, float(value)))
+        except ValueError:
+            pass
+    # Jitter prevents multiple app threads from retrying simultaneously.
+    return min(30.0, (2 ** attempt) + random.uniform(0, 0.5))
+
+
+class _QueuedRequest:
+    __slots__ = ("url", "headers", "data", "timeout", "event", "response", "error")
+
+    def __init__(self, url, headers, data, timeout):
+        self.url = url
+        self.headers = headers
+        self.data = data
+        self.timeout = timeout
+        self.event = threading.Event()
+        self.response = None
+        self.error = None
+
+
+def _worker():
+    while True:
+        item = request_queue.get()
+        try:
+            for attempt in range(MAX_RETRIES + 1):
+                try:
+                    _pace_upstream_request()
+                    response = http_session.post(
+                        item.url,
+                        headers=item.headers,
+                        data=item.data,
+                        timeout=item.timeout,
+                    )
+                    if response.status_code != 429:
+                        item.response = response
+                        break
+
+                    if attempt >= MAX_RETRIES:
+                        item.response = response
+                        break
+
+                    delay = _retry_after_seconds(response, attempt)
+                    logger.warning(
+                        "[429] Upstream rate limit for %s; retrying in %.2fs (%d/%d)",
+                        item.url, delay, attempt + 1, MAX_RETRIES
+                    )
+                    time.sleep(delay)
+                except requests.RequestException as exc:
+                    if attempt >= MAX_RETRIES:
+                        item.error = exc
+                        break
+                    delay = min(15.0, (2 ** attempt) * 0.5 + random.uniform(0, 0.25))
+                    logger.warning(
+                        "[UPSTREAM] %s; retrying in %.2fs (%d/%d)",
+                        exc, delay, attempt + 1, MAX_RETRIES
+                    )
+                    time.sleep(delay)
+        finally:
+            item.event.set()
+            request_queue.task_done()
+
+
+worker_thread = threading.Thread(target=_worker, name="upstream-worker", daemon=True)
+worker_thread.start()
+
+
+class UpstreamRateLimitError(Exception):
+    def __init__(self, message, status_code=429, retry_after=None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after = retry_after
+
+
+def queued_post(url, headers=None, data=None, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)):
+    item = _QueuedRequest(url, headers, data, timeout)
+    try:
+        request_queue.put_nowait(item)
+    except Exception:
+        raise UpstreamRateLimitError(
+            "Upstream request queue is full. Please try again shortly.", 503, 5
+        )
+
+    if not item.event.wait(timeout=READ_TIMEOUT + 40):
+        raise UpstreamRateLimitError(
+            "Upstream server did not respond in time. Please try again.", 504
+        )
+    if item.error:
+        raise item.error
+    if item.response is None:
+        raise UpstreamRateLimitError("No response from upstream server.", 502)
+    return item.response
 
 # ------------------ Protobuf to Dict ------------------
 def proto_to_dict(message):
@@ -162,7 +296,10 @@ def ensure_jwt_token_sync(region):
         url = endpoints.get(region, endpoints["default"])
 
         try:
-            response = http_session.get(url, timeout=10)
+            response = http_session.get(url, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+            if response.status_code == 429:
+                retry_after = response.headers.get("Retry-After", "5")
+                raise UpstreamRateLimitError("JWT service rate limited", 429, retry_after)
             response.raise_for_status()
             data = response.json()
 
@@ -227,7 +364,10 @@ def apis(idd, region):
     
     try:
         data = bytes.fromhex(idd)
-        response = http_session.post(endpoint, headers=headers, data=data, timeout=10)
+        response = queued_post(endpoint, headers=headers, data=data)
+        if response.status_code == 429:
+            retry_after = response.headers.get("Retry-After")
+            raise UpstreamRateLimitError("Free Fire API rate limit reached", 429, retry_after)
         response.raise_for_status()
         return response.content.hex()
     except requests.exceptions.RequestException as e:
@@ -387,11 +527,18 @@ def get_player_info():
         result = proto_to_dict(message)
         return jsonify(result)
     
+    except UpstreamRateLimitError as e:
+        payload = {"error": str(e), "status": "rate_limited"}
+        if e.retry_after is not None:
+            payload["retry_after"] = e.retry_after
+        return jsonify(payload), e.status_code
+    except requests.Timeout:
+        return jsonify({"error": "Upstream server timed out. Please try again.", "status": "upstream_timeout"}), 504
     except ValueError:
         return jsonify({"error": "Invalid UID format"}), 400
     except Exception as e:
         logger.error(f"[ERROR] Processing request: {e}")
-        return jsonify({"error": f"Failure to process the data: {str(e)}"}), 500
+        return jsonify({"error": "Failure to process the data", "status": "internal_error"}), 500
 
 @app.route('/wishlist', methods=['GET'])
 def get_wishlist_info():
@@ -425,7 +572,10 @@ def get_wishlist_info():
             'Content-Type': 'application/x-www-form-urlencoded',
         }
 
-        response = http_session.post(wishlist_url, headers=headers, data=bytes.fromhex(encrypted_hex), timeout=10)
+        response = queued_post(wishlist_url, headers=headers, data=bytes.fromhex(encrypted_hex))
+        if response.status_code == 429:
+            retry_after = response.headers.get("Retry-After")
+            raise UpstreamRateLimitError("Wishlist API rate limit reached", 429, retry_after)
         response.raise_for_status()
         resp_hex = response.content.hex()
         
@@ -435,9 +585,16 @@ def get_wishlist_info():
         result = proto_to_dict(res)
         return jsonify(result)
 
+    except UpstreamRateLimitError as e:
+        payload = {"error": str(e), "status": "rate_limited"}
+        if e.retry_after is not None:
+            payload["retry_after"] = e.retry_after
+        return jsonify(payload), e.status_code
+    except requests.Timeout:
+        return jsonify({"error": "Upstream server timed out. Please try again.", "status": "upstream_timeout"}), 504
     except Exception as e:
         logger.error(f"[ERROR] Wishlist request: {e}")
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "Failure to process the wishlist request", "status": "internal_error"}), 500
 
 @app.route('/favicon.ico')
 def favicon():
