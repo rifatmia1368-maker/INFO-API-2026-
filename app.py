@@ -8,9 +8,6 @@ import time
 import logging
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from collections import defaultdict
-from functools import wraps
-import queue
 
 from data_pb2 import AccountPersonalShowInfo
 from google.protobuf.descriptor import FieldDescriptor
@@ -23,11 +20,6 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# ------------------ Rate Limiting ------------------
-rate_limit_store = defaultdict(list)
-RATE_LIMIT = 5  # requests per minute per IP
-RATE_LIMIT_PERIOD = 60  # seconds
-
 # ------------------ JWT Cache ------------------
 jwt_tokens = {}
 jwt_expiry = {}
@@ -37,44 +29,18 @@ jwt_lock = threading.Lock()
 def create_http_session():
     session = requests.Session()
     retry = Retry(
-        total=5,
-        backoff_factor=1.0,  # Increased for better backoff
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET", "POST"],
-        raise_on_status=False
+        total=3,
+        backoff_factor=0.5,
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=["GET", "POST"]
     )
-    adapter = HTTPAdapter(
-        max_retries=retry, 
-        pool_connections=10,  # Reduced to prevent overwhelming
-        pool_maxsize=10,
-        pool_block=True  # Block when pool is exhausted
-    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
     session.mount('http://', adapter)
     session.mount('https://', adapter)
+    session.timeout = (5, 10)  # connect timeout, read timeout
     return session
 
 http_session = create_http_session()
-
-# ------------------ Retry Decorator for 429 ------------------
-def retry_on_429(max_retries=5):
-    def decorator(func):
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            retries = 0
-            while retries < max_retries:
-                try:
-                    return func(*args, **kwargs)
-                except requests.exceptions.RequestException as e:
-                    if "429" in str(e) and retries < max_retries - 1:
-                        delay = (2 ** retries) + (retries * 0.5)  # Exponential: 1, 2.5, 4.5, 8, 16
-                        logger.warning(f"[RETRY] Rate limited. Waiting {delay:.1f}s (attempt {retries + 1}/{max_retries})")
-                        time.sleep(delay)
-                        retries += 1
-                    else:
-                        raise
-            raise Exception(f"Max retries ({max_retries}) exceeded")
-        return wrapper
-    return decorator
 
 # ------------------ Protobuf to Dict ------------------
 def proto_to_dict(message):
@@ -125,6 +91,7 @@ def proto_to_dict(message):
             result[field.name] = value
 
     return result
+
 
 def extract_token_from_response(data, region):
     """Safely extract JWT token from API response."""
@@ -213,6 +180,7 @@ def ensure_jwt_token_sync(region):
 
     return jwt_tokens.get(region)
 
+
 def get_api_endpoint(region):
     endpoints = {
         "IND": "https://client.ind.freefiremobile.com/GetPlayerPersonalShow",
@@ -229,22 +197,6 @@ def get_api_endpoint(region):
     }
     return endpoints.get(region, endpoints["default"])
 
-def get_wishlist_endpoint(region):
-    endpoints = {
-        "IND": "https://client.ind.freefiremobile.com/GetWishListItems",
-        "BR": "https://client.us.freefiremobile.com/GetWishListItems",
-        "US": "https://client.us.freefiremobile.com/GetWishListItems",
-        "SAC": "https://client.us.freefiremobile.com/GetWishListItems",
-        "BD": "https://clientbp.ggpolarbear.com/GetWishListItems",
-        "ID": "https://clientbp.ggpolarbear.com/GetWishListItems",
-        "PK": "https://clientbp.ggpolarbear.com/GetWishListItems",
-        "VN": "https://clientbp.ggpolarbear.com/GetWishListItems",
-        "ME": "https://clientbp.ggpolarbear.com/GetWishListItems",
-        "TH": "https://clientbp.ggpolarbear.com/GetWishListItems",
-        "default": "https://clientbp.ggpolarbear.com/GetWishListItems"
-    }
-    return endpoints.get(region, endpoints["default"])
-
 default_key = "Yg&tc%DEuh6%Zc^8"
 default_iv = "6oyZDr22E3ychjM%"
 
@@ -256,8 +208,6 @@ def encrypt_aes(hex_data, key, iv):
     encrypted_data = cipher.encrypt(padded_data)
     return binascii.hexlify(encrypted_data).decode()
 
-# Apply retry decorator to API functions
-@retry_on_429(max_retries=5)
 def apis(idd, region):
     token = ensure_jwt_token_sync(region)
     if not token:
@@ -283,46 +233,6 @@ def apis(idd, region):
     except requests.exceptions.RequestException as e:
         logger.error(f"[API] Request to {endpoint} failed: {e}")
         raise
-
-@retry_on_429(max_retries=5)
-def apis_wishlist(idd, region):
-    token = ensure_jwt_token_sync(region)
-    if not token:
-        raise Exception(f"Failed to get JWT token for region {region}")
-    
-    endpoint = get_wishlist_endpoint(region)
-    headers = {
-        'User-Agent': 'Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)',
-        'Connection': 'Keep-Alive',
-        'Expect': '100-continue',
-        'Authorization': f'Bearer {token}',
-        'X-Unity-Version': '2018.4.11f1',
-        'X-GA': 'v1 1',
-        'ReleaseVersion': 'OB54',
-        'Content-Type': 'application/x-www-form-urlencoded',
-    }
-    
-    try:
-        data = bytes.fromhex(idd)
-        response = http_session.post(endpoint, headers=headers, data=data, timeout=10)
-        response.raise_for_status()
-        return response.content.hex()
-    except requests.exceptions.RequestException as e:
-        logger.error(f"[API] Wishlist request to {endpoint} failed: {e}")
-        raise
-
-# ------------------ Rate Limiting Check ------------------
-def check_rate_limit(ip):
-    """Check if IP is rate limited"""
-    now = time.time()
-    # Clean old requests
-    rate_limit_store[ip] = [t for t in rate_limit_store[ip] if now - t < RATE_LIMIT_PERIOD]
-    
-    if len(rate_limit_store[ip]) >= RATE_LIMIT:
-        return True
-    
-    rate_limit_store[ip].append(now)
-    return False
 
 # ------------------ Flask Routes ------------------
 @app.route('/', methods=['GET'])
@@ -447,19 +357,10 @@ def home():
     """
     return html_content
 
+
 @app.route('/info', methods=['GET'])
 def get_player_info():
     try:
-        # Get client IP for rate limiting
-        client_ip = request.remote_addr
-        
-        # Check rate limit
-        if check_rate_limit(client_ip):
-            return jsonify({
-                "error": f"Rate limit exceeded. Maximum {RATE_LIMIT} requests per {RATE_LIMIT_PERIOD} seconds.",
-                "retry_after": RATE_LIMIT_PERIOD
-            }), 429
-        
         uid = request.args.get('uid')
         region = request.args.get('region', 'BD').upper()
         custom_key = request.args.get('key', default_key)
@@ -468,16 +369,8 @@ def get_player_info():
         if not uid:
             return jsonify({"error": "UID parameter is required"}), 400
         
-        # Validate UID
-        try:
-            uid_int = int(uid)
-            if uid_int <= 0:
-                raise ValueError
-        except ValueError:
-            return jsonify({"error": "Invalid UID format. Must be a positive integer."}), 400
-        
         message = uid_generator_pb2.uid_generator()
-        message.saturn_ = uid_int
+        message.saturn_ = int(uid)
         message.garena = 1
         protobuf_data = message.SerializeToString()
         hex_data = binascii.hexlify(protobuf_data).decode()
@@ -496,14 +389,6 @@ def get_player_info():
     
     except ValueError:
         return jsonify({"error": "Invalid UID format"}), 400
-    except requests.exceptions.RequestException as e:
-        logger.error(f"[ERROR] API Request failed: {e}")
-        if "429" in str(e):
-            return jsonify({
-                "error": "The Free Fire API is currently rate limiting requests. Please try again in a few minutes.",
-                "retry_after": 60
-            }), 429
-        return jsonify({"error": f"API request failed: {str(e)}"}), 500
     except Exception as e:
         logger.error(f"[ERROR] Processing request: {e}")
         return jsonify({"error": f"Failure to process the data: {str(e)}"}), 500
@@ -511,16 +396,6 @@ def get_player_info():
 @app.route('/wishlist', methods=['GET'])
 def get_wishlist_info():
     try:
-        # Get client IP for rate limiting
-        client_ip = request.remote_addr
-        
-        # Check rate limit
-        if check_rate_limit(client_ip):
-            return jsonify({
-                "error": f"Rate limit exceeded. Maximum {RATE_LIMIT} requests per {RATE_LIMIT_PERIOD} seconds.",
-                "retry_after": RATE_LIMIT_PERIOD
-            }), 429
-        
         uid = request.args.get('uid')
         region = request.args.get('region', 'BD').upper()
         custom_key = request.args.get('key', default_key)
@@ -528,40 +403,38 @@ def get_wishlist_info():
         
         if not uid:
             return jsonify({"error": "UID parameter is required"}), 400
-        
-        # Validate UID
-        try:
-            uid_int = int(uid)
-            if uid_int <= 0:
-                raise ValueError
-        except ValueError:
-            return jsonify({"error": "Invalid UID format. Must be a positive integer."}), 400
 
         req = GetWishListItems_pb2.CSGetWishListItemsReq()
-        req.account_id = uid_int
+        req.account_id = int(uid)
         
         protobuf_data = req.SerializeToString()
         hex_data = binascii.hexlify(protobuf_data).decode()
         encrypted_hex = encrypt_aes(hex_data, custom_key, custom_iv)
         
-        api_response = apis_wishlist(encrypted_hex, region)
+        base_endpoint = get_api_endpoint(region)
+        wishlist_url = base_endpoint.replace("GetPlayerPersonalShow", "GetWishListItems")
+        
+        token = ensure_jwt_token_sync(region)
+        headers = {
+            'User-Agent': 'Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)',
+            'Connection': 'Keep-Alive',
+            'Authorization': f'Bearer {token}',
+            'X-Unity-Version': '2018.4.11f1',
+            'X-GA': 'v1 1',
+            'ReleaseVersion': 'OB54',
+            'Content-Type': 'application/x-www-form-urlencoded',
+        }
+
+        response = http_session.post(wishlist_url, headers=headers, data=bytes.fromhex(encrypted_hex), timeout=10)
+        response.raise_for_status()
+        resp_hex = response.content.hex()
         
         res = GetWishListItems_pb2.CSGetWishListItemsRes()
-        res.ParseFromString(bytes.fromhex(api_response))
+        res.ParseFromString(bytes.fromhex(resp_hex))
         
         result = proto_to_dict(res)
         return jsonify(result)
 
-    except ValueError:
-        return jsonify({"error": "Invalid UID format"}), 400
-    except requests.exceptions.RequestException as e:
-        logger.error(f"[ERROR] Wishlist API Request failed: {e}")
-        if "429" in str(e):
-            return jsonify({
-                "error": "The Free Fire API is currently rate limiting requests. Please try again in a few minutes.",
-                "retry_after": 60
-            }), 429
-        return jsonify({"error": f"API request failed: {str(e)}"}), 500
     except Exception as e:
         logger.error(f"[ERROR] Wishlist request: {e}")
         return jsonify({"error": str(e)}), 500
@@ -570,27 +443,8 @@ def get_wishlist_info():
 def favicon():
     return '', 404
 
-# ------------------ Health Check Endpoint ------------------
-@app.route('/health', methods=['GET'])
-def health_check():
-    return jsonify({
-        "status": "healthy",
-        "rate_limit": {
-            "requests_per_minute": RATE_LIMIT,
-            "current_connections": len(rate_limit_store)
-        },
-        "jwt_status": {
-            region: "valid" if token and time.time() < jwt_expiry.get(region, 0) else "expired"
-            for region, token in jwt_tokens.items()
-        }
-    }), 200
-
 # ------------------ Main ------------------
 if __name__ == "__main__":
-    logger.info("Starting Free Fire API Server...")
-    logger.info(f"Rate Limit: {RATE_LIMIT} requests per {RATE_LIMIT_PERIOD} seconds per IP")
-    logger.info("Server running on http://0.0.0.0:1080")
-    
     # For production, use Gunicorn with multiple workers:
     # gunicorn -w 4 -b 0.0.0.0:1080 app:app
-    app.run(host="0.0.0.0", port=1080, threaded=True, debug=False)
+    app.run(host="0.0.0.0", port=1080, threaded=True)
